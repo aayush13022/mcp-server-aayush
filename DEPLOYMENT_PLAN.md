@@ -321,6 +321,28 @@ openssl rand -hex 32
 
 ## 9. Phase 5 — Deploy & Verify
 
+### 9.0 Pre-deploy readiness (verified locally ✅)
+
+The app was booted exactly as Railway runs it (`uvicorn server:app` with `APP_ENV=production`, `API_KEY`, and `GOOGLE_TOKEN_JSON` set) and behaved correctly:
+
+```
+INFO: Application startup complete.
+GET  /health        → 200 {"status":"ok"}
+POST /append_to_doc → 428 Precondition Required   (confirm gate working)
+```
+
+Readiness checklist — all satisfied in the repo:
+
+- [x] `railway.toml` defines builder, start command, `/health` check, restart policy
+- [x] `runtime.txt` pins Python 3.12 (Nixpacks reads `.python-version` → `runtime.txt`; 3.12 is supported)
+- [x] `requirements.txt` lists all runtime dependencies
+- [x] App binds to `$PORT`; `/health` returns 200 without credentials (safe for health checks)
+- [x] Credentials load from env (`GOOGLE_TOKEN_JSON` / `GOOGLE_CREDENTIALS_JSON`), refresh headlessly, no browser in prod
+- [x] API-key auth + `confirm: true` approval gate enforced
+- [x] Secrets (`credentials.json`, `token.json`) are git-ignored and never committed
+
+The only remaining steps are on Railway's side (below): create the project, set the four variables, generate a domain, and smoke-test.
+
 ### 9.1 Deploy
 
 Railway deploys automatically on push. Watch **Deployments → Build Logs → Deploy Logs**.
