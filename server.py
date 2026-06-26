@@ -15,12 +15,14 @@ API_KEY = os.getenv("API_KEY")
 class AppendToDocRequest(BaseModel):
     doc_id: str
     content: str
+    confirm: bool = False
 
 
 class CreateEmailDraftRequest(BaseModel):
     to: str
     subject: str
     body: str
+    confirm: bool = False
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -37,22 +39,27 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def approve_action(action_name: str, payload: dict) -> bool:
-    """Approve an action.
+def require_confirmation(action_name: str, payload: dict, confirm: bool) -> None:
+    """HTTP-native approval gate.
 
-    In production (headless) actions are auto-approved once the API key has
-    been validated. Locally, prompt for interactive terminal confirmation.
+    The action only proceeds when the caller explicitly sets ``confirm: true``
+    in the request body. Otherwise we return 428 with a preview of exactly
+    what would happen, so the caller can review and re-send to approve. This
+    works identically in local and deployed (headless) environments.
     """
-    if is_production():
-        print(f"\nAction: {action_name}")
-        print(f"Payload: {payload}")
-        print("Auto-approved (production mode).")
-        return True
-
-    print(f"\nAction: {action_name}")
-    print(f"Payload: {payload}")
-    response = input("Approve? (y/n): ").strip().lower()
-    return response == "y"
+    if confirm:
+        return
+    raise HTTPException(
+        status_code=428,
+        detail={
+            "message": (
+                f"Confirmation required for '{action_name}'. "
+                'Resend the same request with "confirm": true to proceed.'
+            ),
+            "action": action_name,
+            "payload": payload,
+        },
+    )
 
 
 @app.get("/health")
@@ -64,9 +71,8 @@ def health():
 def append_to_doc_endpoint(
     request: AppendToDocRequest, _: None = Depends(require_api_key)
 ):
-    payload = request.model_dump()
-    if not approve_action("append_to_doc", payload):
-        raise HTTPException(status_code=403, detail="Action rejected by user")
+    payload = request.model_dump(exclude={"confirm"})
+    require_confirmation("append_to_doc", payload, request.confirm)
 
     try:
         result = append_to_doc(request.doc_id, request.content)
@@ -79,9 +85,8 @@ def append_to_doc_endpoint(
 def create_email_draft_endpoint(
     request: CreateEmailDraftRequest, _: None = Depends(require_api_key)
 ):
-    payload = request.model_dump()
-    if not approve_action("create_email_draft", payload):
-        raise HTTPException(status_code=403, detail="Action rejected by user")
+    payload = request.model_dump(exclude={"confirm"})
+    require_confirmation("create_email_draft", payload, request.confirm)
 
     try:
         result = create_email_draft(request.to, request.subject, request.body)

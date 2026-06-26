@@ -21,7 +21,7 @@ The app works locally but relies on four things that are unavailable in a cloud 
 
 | Local behavior | Why it breaks on Railway | Fix |
 |---|---|---|
-| `input("Approve? (y/n)")` in `server.py` | No interactive terminal in cloud | Replace with API-key auth (auto-approve in prod) |
+| `input("Approve? (y/n)")` in `server.py` | No interactive terminal in cloud | Replace with an HTTP-native `confirm: true` approval field |
 | `flow.run_local_server()` in `auth.py` | No browser / no localhost callback | Pre-generate `token.json` locally, inject via env var |
 | Reads `credentials.json` / `token.json` from disk | Ephemeral filesystem; secrets must not be in git | Load from environment variables |
 | Hardcoded port `8000` | Railway injects a dynamic `$PORT` | Read `PORT` from env |
@@ -65,6 +65,8 @@ flowchart LR
 
 ## 4. Phase 0 — Code Changes (required)
 
+> **Status: ✅ Implemented.** All Phase 0 changes below are already present in the codebase (`auth.py`, `server.py`, `Procfile`, `runtime.txt`, `.dockerignore`). The snippets are kept for reference and to document the design.
+
 These changes must be made and committed before deploying.
 
 ### 4.1 `auth.py` — support environment-based credentials
@@ -79,13 +81,17 @@ Logic to implement:
 - If the token is expired but has a refresh token → call `creds.refresh(Request())` (works headless).
 - If no valid token AND running in production → raise a clear error instead of calling `run_local_server()`.
 
-> **Note on detecting production:** Railway automatically injects a `RAILWAY_ENVIRONMENT` variable into every deployment (you do **not** set it yourself). We also define our own `APP_ENV` toggle so the same code can be forced into production mode locally for testing. `_is_production()` treats either signal as "production".
+> **Note on detecting production:** Railway automatically injects a `RAILWAY_ENVIRONMENT` variable into every deployment (you do **not** set it yourself). We also define our own `APP_ENV` toggle so the same code can be forced into production mode locally for testing. `is_production()` treats either signal as "production".
 
-Example shape:
+Example shape (as implemented in `auth.py`):
 
 ```python
 import json
 import os
+
+def is_production() -> bool:
+    # APP_ENV is our own toggle; RAILWAY_ENVIRONMENT is auto-set by Railway.
+    return os.getenv("APP_ENV") == "production" or bool(os.getenv("RAILWAY_ENVIRONMENT"))
 
 def _load_token():
     raw = os.getenv("GOOGLE_TOKEN_JSON")
@@ -94,35 +100,36 @@ def _load_token():
     if TOKEN_FILE.exists():
         return Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
     return None
-
-def _is_production() -> bool:
-    # APP_ENV is our own toggle; RAILWAY_ENVIRONMENT is auto-set by Railway.
-    return os.getenv("APP_ENV") == "production" or bool(os.getenv("RAILWAY_ENVIRONMENT"))
 ```
 
-### 4.2 `server.py` — production-safe approval (API key)
+`get_credentials()` then loads the token, refreshes it headlessly if expired, raises a clear error in production when no valid token exists, and only falls back to the interactive browser flow (`_run_oauth_flow()`) in local dev.
 
-Replace the interactive `input()` approval with header-based auth.
+### 4.2 `server.py` — API-key authentication
+
+The interactive `input()` prompt cannot run in the cloud (no terminal). It is replaced by two independent mechanisms:
+
+1. **API-key auth** — proves *who* is calling (this section).
+2. **`confirm: true` approval field** — proves the caller *intends* the action (section 4.3).
+
+For auth:
 
 - Read `API_KEY` from env.
 - Require header `X-API-Key` on both POST endpoints.
-- In production, skip the terminal `input()` entirely (auto-approve once the API key matches).
-- In local dev (when `_is_production()` is false), keep the `input()` prompt if you still want it.
 
-> **Important:** In production `API_KEY` must be set. If it is empty, the check below would let every request through. Fail fast at startup if `_is_production()` is true and `API_KEY` is missing.
+> **Important:** In production `API_KEY` must be set. If it is empty, the check below would let every request through. We therefore return 503 in production when no key is configured (fail closed), while allowing local dev with no key.
 
 Example shape:
 
 ```python
 import os
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 API_KEY = os.getenv("API_KEY")
 
 def require_api_key(x_api_key: str = Header(default=None)):
     if not API_KEY:
         # No key configured: block in production, allow in local dev.
-        if _is_production():
+        if is_production():
             raise HTTPException(status_code=503, detail="API_KEY not configured")
         return
     if x_api_key != API_KEY:
@@ -131,7 +138,36 @@ def require_api_key(x_api_key: str = Header(default=None)):
 
 Wire it into each endpoint with FastAPI's dependency injection, e.g. `def append_to_doc_endpoint(request: AppendToDocRequest, _=Depends(require_api_key)):`.
 
-### 4.3 `server.py` — add a health check
+### 4.3 `server.py` — HTTP-native approval gate (`confirm: true`)
+
+The original terminal `y/n` prompt was a human-in-the-loop safety check. We must **keep that safety** in the cloud, not silently auto-approve. Since there is no terminal, the approval moves into the request itself: the caller must explicitly send `"confirm": true`.
+
+Behavior (identical locally and in production):
+
+- Add a `confirm: bool = False` field to each request model.
+- If `confirm` is not `true`, return **HTTP 428 (Precondition Required)** with a preview of the exact action and payload — nothing is executed.
+- The caller reviews the preview, then re-sends the same request with `"confirm": true` to actually perform the action.
+
+Example shape:
+
+```python
+def require_confirmation(action_name: str, payload: dict, confirm: bool) -> None:
+    if confirm:
+        return
+    raise HTTPException(
+        status_code=428,
+        detail={
+            "message": f"Confirmation required for '{action_name}'. "
+                       'Resend with "confirm": true to proceed.',
+            "action": action_name,
+            "payload": payload,
+        },
+    )
+```
+
+This is why no `y/n` terminal prompt appears in the deployed server — approval is now part of the API contract.
+
+### 4.4 `server.py` — add a health check
 
 ```python
 @app.get("/health")
@@ -141,7 +177,7 @@ def health():
 
 Used by Railway's health checks and your smoke tests.
 
-### 4.4 `server.py` — bind to Railway's `$PORT`
+### 4.5 `server.py` — bind to Railway's `$PORT`
 
 ```python
 if __name__ == "__main__":
@@ -150,13 +186,13 @@ if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=port)
 ```
 
-### 4.5 Add a `Procfile`
+### 4.6 Add a `Procfile`
 
 ```
 web: uvicorn server:app --host 0.0.0.0 --port $PORT
 ```
 
-### 4.6 (Optional) Pin Python version
+### 4.7 (Optional) Pin Python version
 
 `runtime.txt`:
 
@@ -164,7 +200,7 @@ web: uvicorn server:app --host 0.0.0.0 --port $PORT
 python-3.12.0
 ```
 
-### 4.7 Confirm `.gitignore`
+### 4.8 Confirm `.gitignore`
 
 Already present and correct — must continue to exclude:
 
@@ -204,7 +240,7 @@ This refreshes `token.json`, which you will copy into Railway.
 ```bash
 cd /Users/aayush/Documents/MCP_Servers/google-mcp-server
 git init
-git add server.py auth.py docs_tool.py gmail_tool.py requirements.txt README.md DEPLOYMENT_PLAN.md .gitignore Procfile
+git add server.py auth.py docs_tool.py gmail_tool.py requirements.txt README.md DEPLOYMENT_PLAN.md .gitignore .dockerignore Procfile runtime.txt
 git commit -m "Prepare Google MCP server for Railway deployment"
 ```
 
@@ -245,7 +281,7 @@ In **Railway → your service → Variables**, add:
 | `GOOGLE_CREDENTIALS_JSON` | Contents of `credentials.json` | One-line JSON |
 | `GOOGLE_TOKEN_JSON` | Contents of `token.json` | One-line JSON |
 | `API_KEY` | Strong random string | Sent by clients as `X-API-Key` |
-| `APP_ENV` | `production` | Enables headless/auto-approve mode |
+| `APP_ENV` | `production` | Enables headless mode (env-based credentials, no browser OAuth) |
 
 > Do **not** add `RAILWAY_ENVIRONMENT` yourself — Railway sets it automatically in every deployment. Your code already treats its presence as "production"; `APP_ENV` is only needed to force production mode when testing locally.
 
@@ -295,7 +331,7 @@ Append to doc:
 curl -X POST https://YOUR-APP.up.railway.app/append_to_doc \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
-  -d '{"doc_id": "YOUR_DOC_ID", "content": "Deployed from Railway!\n"}'
+  -d '{"doc_id": "YOUR_DOC_ID", "content": "Deployed from Railway!\n", "confirm": true}'
 ```
 
 Create Gmail draft:
@@ -304,8 +340,10 @@ Create Gmail draft:
 curl -X POST https://YOUR-APP.up.railway.app/create_email_draft \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
-  -d '{"to": "you@example.com", "subject": "Railway test", "body": "It works!"}'
+  -d '{"to": "you@example.com", "subject": "Railway test", "body": "It works!", "confirm": true}'
 ```
+
+> **Tip:** Omit `"confirm": true` to preview the action — the server returns **HTTP 428** with the exact action and payload, and does nothing. Re-send with `"confirm": true` to actually execute. This is the deployment-safe replacement for the old terminal `y/n` prompt.
 
 ### 9.4 Check logs
 
@@ -364,7 +402,7 @@ Once available, register it (example):
 | Uptime / restarts | Railway dashboard |
 | Application errors | Railway deploy logs |
 | Google API quota | Google Cloud Console → APIs → Quotas |
-| Unauthorized access | Watch for 401/403 in logs |
+| Unauthorized / unconfirmed access | Watch for 401 (bad key) and 428 (missing confirm) in logs |
 
 ---
 
@@ -417,7 +455,7 @@ Then test:
 curl -X POST http://localhost:8000/append_to_doc \
   -H "Content-Type: application/json" \
   -H "X-API-Key: test-key-local" \
-  -d '{"doc_id": "YOUR_DOC_ID", "content": "Local prod test\n"}'
+  -d '{"doc_id": "YOUR_DOC_ID", "content": "Local prod test\n", "confirm": true}'
 ```
 
 ---
@@ -426,18 +464,19 @@ curl -X POST http://localhost:8000/append_to_doc \
 
 | File | Status | Purpose |
 |---|---|---|
-| `server.py` | Needs edit | API key auth, `/health`, `$PORT` |
-| `auth.py` | Needs edit | Env-based credentials, headless |
+| `server.py` | ✅ Done | API-key auth, `confirm` gate, `/health`, `$PORT` |
+| `auth.py` | ✅ Done | Env-based credentials, headless refresh |
 | `docs_tool.py` | No change | Docs append logic |
 | `gmail_tool.py` | No change | Gmail draft logic |
 | `requirements.txt` | No change | Dependencies |
-| `Procfile` | Add | Start command |
-| `runtime.txt` | Optional | Pin Python version |
-| `.gitignore` | OK | Excludes secrets |
+| `Procfile` | ✅ Added | Start command |
+| `runtime.txt` | ✅ Added | Pin Python version |
+| `.dockerignore` | ✅ Added | Exclude secrets/venv from builds |
+| `.gitignore` | ✅ OK | Excludes secrets |
 | `DEPLOYMENT_PLAN.md` | This file | Deployment guide |
 
 ---
 
 ## Next Step
 
-Implement Phase 0 (the code changes for env-based auth, API-key middleware, health check, `$PORT` binding, and `Procfile`), then proceed to Phases 2–5 to go live.
+Phase 0 (code changes) is complete. Proceed with **Phase 2 → Phase 5**: push the latest code to GitHub, create the Railway project, set the environment variables (`GOOGLE_CREDENTIALS_JSON`, `GOOGLE_TOKEN_JSON`, `API_KEY`, `APP_ENV`), generate a domain, set the `/health` check, and run the smoke tests.

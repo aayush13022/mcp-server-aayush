@@ -1,13 +1,14 @@
 # Google MCP Server
 
-A FastAPI server that integrates with Google Docs and Gmail. Before each action runs, it prints the action and payload to the terminal and waits for your approval.
+A FastAPI server that integrates with Google Docs and Gmail. Every action requires an explicit confirmation in the request before it runs, so nothing happens by accident — and this works both locally and when deployed.
 
 ## Features
 
 - **Append to Google Doc** — append text to any document you have access to
 - **Create Gmail draft** — create a draft email without sending it
 - **OAuth 2.0** — credentials are saved locally after the first login
-- **Approval gate** — every request requires `y` in the terminal before execution
+- **Approval gate** — every action requires `"confirm": true` in the request body. Without it, the server returns HTTP 428 with a preview and does nothing.
+- **API-key auth** — when `API_KEY` is set, requests must include an `X-API-Key` header.
 
 ## Project Structure
 
@@ -57,8 +58,6 @@ To re-authenticate, delete `token.json` and restart the server.
 
 ## Running the Server
 
-Run in the foreground so you can see approval prompts in the terminal:
-
 ```bash
 python server.py
 ```
@@ -71,7 +70,18 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 The server listens on `http://localhost:8000`. Interactive API docs are at `http://localhost:8000/docs`.
 
+## Approval model
+
+Every action endpoint requires an explicit `"confirm": true` field in the request body:
+
+- **Without `confirm` (or `confirm: false`)** → the server returns **HTTP 428 (Precondition Required)** with a preview of the action and payload. Nothing is executed.
+- **With `"confirm": true`** → the action runs.
+
+This replaces the old terminal `y/n` prompt with an approval that works the same way locally and when deployed (e.g. on Railway, where there is no terminal). See `DEPLOYMENT_PLAN.md` for details.
+
 ## API Endpoints
+
+> If `API_KEY` is configured, add `-H "X-API-Key: YOUR_API_KEY"` to every request below.
 
 ### POST /append_to_doc
 
@@ -82,7 +92,8 @@ Append text to a Google Doc.
 ```json
 {
   "doc_id": "YOUR_GOOGLE_DOC_ID",
-  "content": "Text to append at the end of the document.\n"
+  "content": "Text to append at the end of the document.\n",
+  "confirm": true
 }
 ```
 
@@ -99,18 +110,20 @@ https://docs.google.com/document/d/ABC123xyz/edit
 ```bash
 curl -X POST http://localhost:8000/append_to_doc \
   -H "Content-Type: application/json" \
-  -d '{"doc_id": "ABC123xyz", "content": "Hello from the MCP server!\n"}'
+  -d '{"doc_id": "ABC123xyz", "content": "Hello from the MCP server!\n", "confirm": true}'
 ```
 
-The terminal shows the action and payload, then prompts:
+If you omit `"confirm": true`, the server responds with HTTP 428 and a preview instead of running the action:
 
+```json
+{
+  "detail": {
+    "message": "Confirmation required for 'append_to_doc'. Resend the same request with \"confirm\": true to proceed.",
+    "action": "append_to_doc",
+    "payload": {"doc_id": "ABC123xyz", "content": "Hello from the MCP server!\n"}
+  }
+}
 ```
-Action: append_to_doc
-Payload: {'doc_id': 'ABC123xyz', 'content': 'Hello from the MCP server!\n'}
-Approve? (y/n):
-```
-
-Type `y` to proceed or anything else to reject (returns HTTP 403).
 
 ### POST /create_email_draft
 
@@ -122,7 +135,8 @@ Create a Gmail draft.
 {
   "to": "recipient@example.com",
   "subject": "Draft subject line",
-  "body": "Plain-text body of the email."
+  "body": "Plain-text body of the email.",
+  "confirm": true
 }
 ```
 
@@ -131,10 +145,10 @@ Create a Gmail draft.
 ```bash
 curl -X POST http://localhost:8000/create_email_draft \
   -H "Content-Type: application/json" \
-  -d '{"to": "recipient@example.com", "subject": "Hello", "body": "This is a draft."}'
+  -d '{"to": "recipient@example.com", "subject": "Hello", "body": "This is a draft.", "confirm": true}'
 ```
 
-Same approval prompt applies before the draft is created.
+The same `confirm` approval applies before the draft is created.
 
 ## OAuth Scopes
 
@@ -146,8 +160,8 @@ Same approval prompt applies before the draft is created.
 ## Security Notes
 
 - Never commit `credentials.json` or `token.json` — both are listed in `.gitignore`.
-- The approval prompt runs in the server terminal; keep the server in the foreground when testing.
-- Rejecting an action returns HTTP 403 with `"Action rejected by user"`.
+- Every action requires `"confirm": true`; requests without it return HTTP 428 and execute nothing.
+- Set `API_KEY` in any shared/deployed environment so requests must carry a valid `X-API-Key` header.
 
 ## Troubleshooting
 
@@ -157,4 +171,5 @@ Same approval prompt applies before the draft is created.
 | `403 Access Not Configured` | Enable the Docs and Gmail APIs in your Google Cloud project. |
 | Token expired / invalid | Delete `token.json` and re-authenticate. |
 | Doc not found | Confirm the doc ID and that the signed-in account has edit access. |
-| Approval prompt not visible | Run the server in a terminal (not as a background daemon). |
+| `428 Precondition Required` | Add `"confirm": true` to the request body to approve the action. |
+| `401 Invalid or missing API key` | Include the `X-API-Key` header matching the server's `API_KEY`. |
