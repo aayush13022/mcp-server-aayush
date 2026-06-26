@@ -192,6 +192,26 @@ if __name__ == "__main__":
 web: uvicorn server:app --host 0.0.0.0 --port $PORT
 ```
 
+### 4.6b Add a `railway.json` (explicit Railway config)
+
+Railway can deploy from `Procfile` + Nixpacks auto-detection alone, but an explicit `railway.json` makes the build/deploy settings visible and version-controlled (start command, health check, restart policy):
+
+```json
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": { "builder": "NIXPACKS" },
+  "deploy": {
+    "startCommand": "uvicorn server:app --host 0.0.0.0 --port $PORT",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 100,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
+```
+
+Settings in `railway.json` override the dashboard equivalents, so you don't have to configure the start command or health check path manually.
+
 ### 4.7 (Optional) Pin Python version
 
 `runtime.txt`:
@@ -470,6 +490,7 @@ curl -X POST http://localhost:8000/append_to_doc \
 | `gmail_tool.py` | No change | Gmail draft logic |
 | `requirements.txt` | No change | Dependencies |
 | `Procfile` | ✅ Added | Start command |
+| `railway.json` | ✅ Added | Explicit Railway build/deploy config |
 | `runtime.txt` | ✅ Added | Pin Python version |
 | `.dockerignore` | ✅ Added | Exclude secrets/venv from builds |
 | `.gitignore` | ✅ OK | Excludes secrets |
