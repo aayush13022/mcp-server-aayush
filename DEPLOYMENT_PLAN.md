@@ -192,26 +192,6 @@ if __name__ == "__main__":
 web: uvicorn server:app --host 0.0.0.0 --port $PORT
 ```
 
-### 4.6b Add a `railway.json` (explicit Railway config)
-
-Railway can deploy from `Procfile` + Nixpacks auto-detection alone, but an explicit `railway.json` makes the build/deploy settings visible and version-controlled (start command, health check, restart policy):
-
-```json
-{
-  "$schema": "https://railway.com/railway.schema.json",
-  "build": { "builder": "NIXPACKS" },
-  "deploy": {
-    "startCommand": "uvicorn server:app --host 0.0.0.0 --port $PORT",
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 100,
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
-  }
-}
-```
-
-Settings in `railway.json` override the dashboard equivalents, so you don't have to configure the start command or health check path manually.
-
 ### 4.7 (Optional) Pin Python version
 
 `runtime.txt`:
@@ -282,6 +262,23 @@ gh repo create google-mcp-server --private --source=. --push
 4. Railway auto-detects Python (Nixpacks) via `requirements.txt`.
 
 ### Service settings
+
+A `railway.toml` is committed at the repo root, so Railway applies the start command, health check, and restart policy automatically — you normally don't need to set these by hand:
+
+```toml
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn server:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+numReplicas = 1
+```
+
+For reference, the equivalent dashboard settings are:
 
 | Setting | Value |
 |---|---|
@@ -489,8 +486,8 @@ curl -X POST http://localhost:8000/append_to_doc \
 | `docs_tool.py` | No change | Docs append logic |
 | `gmail_tool.py` | No change | Gmail draft logic |
 | `requirements.txt` | No change | Dependencies |
-| `Procfile` | ✅ Added | Start command |
-| `railway.json` | ✅ Added | Explicit Railway build/deploy config |
+| `Procfile` | ✅ Added | Start command (fallback) |
+| `railway.toml` | ✅ Added | Railway build/deploy config |
 | `runtime.txt` | ✅ Added | Pin Python version |
 | `.dockerignore` | ✅ Added | Exclude secrets/venv from builds |
 | `.gitignore` | ✅ OK | Excludes secrets |
