@@ -17,8 +17,8 @@ TOKEN_FILE = BASE_DIR / "token.json"
 
 
 def is_production() -> bool:
-    """True when running on Railway or when forced via APP_ENV."""
-    return os.getenv("APP_ENV") == "production" or bool(
+    """True when running on Railway or when forced via ENV=production."""
+    return os.getenv("ENV") == "production" or bool(
         os.getenv("RAILWAY_ENVIRONMENT")
     )
 

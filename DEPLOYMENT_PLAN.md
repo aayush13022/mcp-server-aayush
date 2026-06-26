@@ -39,8 +39,9 @@ flowchart LR
 
     Vars[Railway Variables] -->|GOOGLE_CREDENTIALS_JSON| Railway
     Vars -->|GOOGLE_TOKEN_JSON| Railway
-    Vars -->|API_KEY| Railway
-    Vars -->|APP_ENV| Railway
+    Vars -->|API_SECRET_KEY| Railway
+    Vars -->|ENV| Railway
+    Vars -->|REQUIRE_TERMINAL_APPROVAL| Railway
 ```
 
 ---
@@ -81,7 +82,7 @@ Logic to implement:
 - If the token is expired but has a refresh token → call `creds.refresh(Request())` (works headless).
 - If no valid token AND running in production → raise a clear error instead of calling `run_local_server()`.
 
-> **Note on detecting production:** Railway automatically injects a `RAILWAY_ENVIRONMENT` variable into every deployment (you do **not** set it yourself). We also define our own `APP_ENV` toggle so the same code can be forced into production mode locally for testing. `is_production()` treats either signal as "production".
+> **Note on detecting production:** Railway automatically injects a `RAILWAY_ENVIRONMENT` variable into every deployment (you do **not** set it yourself). We also define our own `ENV` toggle so the same code can be forced into production mode locally for testing. `is_production()` treats either signal as "production".
 
 Example shape (as implemented in `auth.py`):
 
@@ -90,8 +91,8 @@ import json
 import os
 
 def is_production() -> bool:
-    # APP_ENV is our own toggle; RAILWAY_ENVIRONMENT is auto-set by Railway.
-    return os.getenv("APP_ENV") == "production" or bool(os.getenv("RAILWAY_ENVIRONMENT"))
+    # ENV is our own toggle; RAILWAY_ENVIRONMENT is auto-set by Railway.
+    return os.getenv("ENV") == "production" or bool(os.getenv("RAILWAY_ENVIRONMENT"))
 
 def _load_token():
     raw = os.getenv("GOOGLE_TOKEN_JSON")
@@ -113,10 +114,10 @@ The interactive `input()` prompt cannot run in the cloud (no terminal). It is re
 
 For auth:
 
-- Read `API_KEY` from env.
+- Read `API_SECRET_KEY` from env.
 - Require header `X-API-Key` on both POST endpoints.
 
-> **Important:** In production `API_KEY` must be set. If it is empty, the check below would let every request through. We therefore return 503 in production when no key is configured (fail closed), while allowing local dev with no key.
+> **Important:** In production `API_SECRET_KEY` must be set. If it is empty, the check below would let every request through. We therefore return 503 in production when no key is configured (fail closed), while allowing local dev with no key.
 
 Example shape:
 
@@ -124,34 +125,42 @@ Example shape:
 import os
 from fastapi import Depends, Header, HTTPException
 
-API_KEY = os.getenv("API_KEY")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 
 def require_api_key(x_api_key: str = Header(default=None)):
-    if not API_KEY:
+    if not API_SECRET_KEY:
         # No key configured: block in production, allow in local dev.
         if is_production():
-            raise HTTPException(status_code=503, detail="API_KEY not configured")
+            raise HTTPException(status_code=503, detail="API_SECRET_KEY not configured")
         return
-    if x_api_key != API_KEY:
+    if x_api_key != API_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 ```
 
 Wire it into each endpoint with FastAPI's dependency injection, e.g. `def append_to_doc_endpoint(request: AppendToDocRequest, _=Depends(require_api_key)):`.
 
-### 4.3 `server.py` — HTTP-native approval gate (`confirm: true`)
+### 4.3 `server.py` — approval gate (`REQUIRE_TERMINAL_APPROVAL` + `confirm: true`)
 
-The original terminal `y/n` prompt was a human-in-the-loop safety check. We must **keep that safety** in the cloud, not silently auto-approve. Since there is no terminal, the approval moves into the request itself: the caller must explicitly send `"confirm": true`.
+The original terminal `y/n` prompt was a human-in-the-loop safety check. We must **keep that safety** — but a terminal prompt cannot work in the cloud (no terminal). So approval has **two interchangeable modes**, selected by the `REQUIRE_TERMINAL_APPROVAL` env var:
 
-Behavior (identical locally and in production):
+| `REQUIRE_TERMINAL_APPROVAL` | Behavior | Where to use |
+|---|---|---|
+| `true` | Interactive terminal `y/n` prompt before each action; rejecting returns **HTTP 403** | Local, running uvicorn in a foreground terminal |
+| `false` (default) | Caller must send `"confirm": true` in the body; otherwise returns **HTTP 428** with a preview and does nothing | Deployed / headless (Railway) |
 
-- Add a `confirm: bool = False` field to each request model.
-- If `confirm` is not `true`, return **HTTP 428 (Precondition Required)** with a preview of the exact action and payload — nothing is executed.
-- The caller reviews the preview, then re-sends the same request with `"confirm": true` to actually perform the action.
+So on Railway you set `REQUIRE_TERMINAL_APPROVAL=false`, and approval is enforced via the `confirm` field instead of a terminal you can't reach.
 
 Example shape:
 
 ```python
-def require_confirmation(action_name: str, payload: dict, confirm: bool) -> None:
+REQUIRE_TERMINAL_APPROVAL = os.getenv("REQUIRE_TERMINAL_APPROVAL", "false").lower() == "true"
+
+def approve_action(action_name: str, payload: dict, confirm: bool) -> None:
+    if REQUIRE_TERMINAL_APPROVAL:
+        print(f"Action: {action_name}\nPayload: {payload}")
+        if input("Approve? (y/n): ").strip().lower() != "y":
+            raise HTTPException(status_code=403, detail="Action rejected by user")
+        return
     if confirm:
         return
     raise HTTPException(
@@ -165,7 +174,7 @@ def require_confirmation(action_name: str, payload: dict, confirm: bool) -> None
     )
 ```
 
-This is why no `y/n` terminal prompt appears in the deployed server — approval is now part of the API contract.
+Each request model also gains a `confirm: bool = False` field. This is why no `y/n` terminal prompt appears in the deployed server — in production approval is part of the API contract.
 
 ### 4.4 `server.py` — add a health check
 
@@ -297,10 +306,11 @@ In **Railway → your service → Variables**, add:
 |---|---|---|
 | `GOOGLE_CREDENTIALS_JSON` | Contents of `credentials.json` | One-line JSON |
 | `GOOGLE_TOKEN_JSON` | Contents of `token.json` | One-line JSON |
-| `API_KEY` | Strong random string | Sent by clients as `X-API-Key` |
-| `APP_ENV` | `production` | Enables headless mode (env-based credentials, no browser OAuth) |
+| `API_SECRET_KEY` | Strong random string | Sent by clients as the `X-API-Key` header |
+| `ENV` | `production` | Enables headless mode (env-based credentials, no browser OAuth) |
+| `REQUIRE_TERMINAL_APPROVAL` | `false` | Must be `false` in the cloud — there is no terminal. Approval is enforced via `confirm: true` instead. |
 
-> Do **not** add `RAILWAY_ENVIRONMENT` yourself — Railway sets it automatically in every deployment. Your code already treats its presence as "production"; `APP_ENV` is only needed to force production mode when testing locally.
+> Do **not** add `RAILWAY_ENVIRONMENT` yourself — Railway sets it automatically in every deployment. Your code already treats its presence as "production"; `ENV` is only needed to force production mode when testing locally.
 
 ### Helper commands
 
@@ -323,7 +333,7 @@ openssl rand -hex 32
 
 ### 9.0 Pre-deploy readiness (verified locally ✅)
 
-The app was booted exactly as Railway runs it (`uvicorn server:app` with `APP_ENV=production`, `API_KEY`, and `GOOGLE_TOKEN_JSON` set) and behaved correctly:
+The app was booted exactly as Railway runs it (`uvicorn server:app` with `ENV=production`, `API_SECRET_KEY`, `REQUIRE_TERMINAL_APPROVAL=false`, and `GOOGLE_TOKEN_JSON` set) and behaved correctly:
 
 ```
 INFO: Application startup complete.
@@ -447,11 +457,11 @@ Once available, register it (example):
 
 ## 12. Security Checklist
 
-- [ ] `API_KEY` required on all POST endpoints
+- [ ] `API_SECRET_KEY` required on all POST endpoints
 - [ ] `credentials.json` and `token.json` never committed to git
 - [ ] GitHub repo is **private**
 - [ ] Google OAuth app stays in Testing until ready for wider use
-- [ ] Rotate `API_KEY` if it is ever exposed
+- [ ] Rotate `API_SECRET_KEY` if it is ever exposed
 - [ ] Consider restricting access (IP allowlist) if only you call it
 
 ---
@@ -482,8 +492,9 @@ Test production behavior before deploying:
 ```bash
 export GOOGLE_CREDENTIALS_JSON="$(cat credentials.json)"
 export GOOGLE_TOKEN_JSON="$(cat token.json)"
-export API_KEY="test-key-local"
-export APP_ENV="production"
+export API_SECRET_KEY="test-key-local"
+export ENV="production"
+export REQUIRE_TERMINAL_APPROVAL="false"
 
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
@@ -519,4 +530,4 @@ curl -X POST http://localhost:8000/append_to_doc \
 
 ## Next Step
 
-Phase 0 (code changes) is complete. Proceed with **Phase 2 → Phase 5**: push the latest code to GitHub, create the Railway project, set the environment variables (`GOOGLE_CREDENTIALS_JSON`, `GOOGLE_TOKEN_JSON`, `API_KEY`, `APP_ENV`), generate a domain, set the `/health` check, and run the smoke tests.
+Phase 0 (code changes) is complete. Proceed with **Phase 2 → Phase 5**: push the latest code to GitHub, create the Railway project, set the environment variables (`GOOGLE_CREDENTIALS_JSON`, `GOOGLE_TOKEN_JSON`, `API_SECRET_KEY`, `ENV`, `REQUIRE_TERMINAL_APPROVAL`), generate a domain, set the `/health` check, and run the smoke tests.

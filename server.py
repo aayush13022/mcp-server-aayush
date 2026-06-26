@@ -9,7 +9,10 @@ from gmail_tool import create_email_draft
 
 app = FastAPI(title="Google MCP Server", version="1.0.0")
 
-API_KEY = os.getenv("API_KEY")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
+REQUIRE_TERMINAL_APPROVAL = (
+    os.getenv("REQUIRE_TERMINAL_APPROVAL", "false").strip().lower() == "true"
+)
 
 
 class AppendToDocRequest(BaseModel):
@@ -31,22 +34,35 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
     In production an API key MUST be configured; if it is missing we refuse
     all requests. In local dev with no key set, requests are allowed.
     """
-    if not API_KEY:
+    if not API_SECRET_KEY:
         if is_production():
-            raise HTTPException(status_code=503, detail="API_KEY not configured")
+            raise HTTPException(
+                status_code=503, detail="API_SECRET_KEY not configured"
+            )
         return
-    if x_api_key != API_KEY:
+    if x_api_key != API_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def require_confirmation(action_name: str, payload: dict, confirm: bool) -> None:
-    """HTTP-native approval gate.
+def approve_action(action_name: str, payload: dict, confirm: bool) -> None:
+    """Approval gate with two interchangeable modes.
 
-    The action only proceeds when the caller explicitly sets ``confirm: true``
-    in the request body. Otherwise we return 428 with a preview of exactly
-    what would happen, so the caller can review and re-send to approve. This
-    works identically in local and deployed (headless) environments.
+    - REQUIRE_TERMINAL_APPROVAL=true  → interactive terminal ``y/n`` prompt.
+      Suitable for running locally in a foreground terminal. Rejecting raises
+      HTTP 403.
+    - REQUIRE_TERMINAL_APPROVAL=false → headless HTTP approval: the caller must
+      set ``confirm: true`` in the request body, otherwise we return HTTP 428
+      with a preview. This is the deployment-safe default (e.g. on Railway,
+      where there is no terminal).
     """
+    if REQUIRE_TERMINAL_APPROVAL:
+        print(f"\nAction: {action_name}")
+        print(f"Payload: {payload}")
+        response = input("Approve? (y/n): ").strip().lower()
+        if response != "y":
+            raise HTTPException(status_code=403, detail="Action rejected by user")
+        return
+
     if confirm:
         return
     raise HTTPException(
@@ -72,7 +88,7 @@ def append_to_doc_endpoint(
     request: AppendToDocRequest, _: None = Depends(require_api_key)
 ):
     payload = request.model_dump(exclude={"confirm"})
-    require_confirmation("append_to_doc", payload, request.confirm)
+    approve_action("append_to_doc", payload, request.confirm)
 
     try:
         result = append_to_doc(request.doc_id, request.content)
@@ -86,7 +102,7 @@ def create_email_draft_endpoint(
     request: CreateEmailDraftRequest, _: None = Depends(require_api_key)
 ):
     payload = request.model_dump(exclude={"confirm"})
-    require_confirmation("create_email_draft", payload, request.confirm)
+    approve_action("create_email_draft", payload, request.confirm)
 
     try:
         result = create_email_draft(request.to, request.subject, request.body)

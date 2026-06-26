@@ -8,7 +8,7 @@ A FastAPI server that integrates with Google Docs and Gmail. Every action requir
 - **Create Gmail draft** — create a draft email without sending it
 - **OAuth 2.0** — credentials are saved locally after the first login
 - **Approval gate** — every action requires `"confirm": true` in the request body. Without it, the server returns HTTP 428 with a preview and does nothing.
-- **API-key auth** — when `API_KEY` is set, requests must include an `X-API-Key` header.
+- **API-key auth** — when `API_SECRET_KEY` is set, requests must include an `X-API-Key` header.
 
 ## Project Structure
 
@@ -72,16 +72,16 @@ The server listens on `http://localhost:8000`. Interactive API docs are at `http
 
 ## Approval model
 
-Every action endpoint requires an explicit `"confirm": true` field in the request body:
+Approval has two interchangeable modes, selected by the `REQUIRE_TERMINAL_APPROVAL` environment variable:
 
-- **Without `confirm` (or `confirm: false`)** → the server returns **HTTP 428 (Precondition Required)** with a preview of the action and payload. Nothing is executed.
-- **With `"confirm": true`** → the action runs.
+- **`REQUIRE_TERMINAL_APPROVAL=true`** (local, foreground terminal) → the server prints the action and payload and prompts `Approve? (y/n)` in the terminal. Answering anything but `y` returns **HTTP 403**.
+- **`REQUIRE_TERMINAL_APPROVAL=false`** (default; required when deployed) → the caller must include `"confirm": true` in the request body. Without it, the server returns **HTTP 428 (Precondition Required)** with a preview and executes nothing.
 
-This replaces the old terminal `y/n` prompt with an approval that works the same way locally and when deployed (e.g. on Railway, where there is no terminal). See `DEPLOYMENT_PLAN.md` for details.
+The headless `confirm` mode exists because a deployed server (e.g. on Railway) has no terminal to prompt in. See `DEPLOYMENT_PLAN.md` for details.
 
 ## API Endpoints
 
-> If `API_KEY` is configured, add `-H "X-API-Key: YOUR_API_KEY"` to every request below.
+> If `API_SECRET_KEY` is configured, add `-H "X-API-Key: YOUR_API_KEY"` to every request below.
 
 ### POST /append_to_doc
 
@@ -161,7 +161,7 @@ The same `confirm` approval applies before the draft is created.
 
 - Never commit `credentials.json` or `token.json` — both are listed in `.gitignore`.
 - Every action requires `"confirm": true`; requests without it return HTTP 428 and execute nothing.
-- Set `API_KEY` in any shared/deployed environment so requests must carry a valid `X-API-Key` header.
+- Set `API_SECRET_KEY` in any shared/deployed environment so requests must carry a valid `X-API-Key` header.
 
 ## Troubleshooting
 
@@ -172,4 +172,4 @@ The same `confirm` approval applies before the draft is created.
 | Token expired / invalid | Delete `token.json` and re-authenticate. |
 | Doc not found | Confirm the doc ID and that the signed-in account has edit access. |
 | `428 Precondition Required` | Add `"confirm": true` to the request body to approve the action. |
-| `401 Invalid or missing API key` | Include the `X-API-Key` header matching the server's `API_KEY`. |
+| `401 Invalid or missing API key` | Include the `X-API-Key` header matching the server's `API_SECRET_KEY`. |
