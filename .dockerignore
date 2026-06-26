@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+credentials.json
+token.json
+.env
+.git/
+.gitignore
+DEPLOYMENT_PLAN.md
